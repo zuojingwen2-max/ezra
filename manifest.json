@@ -1,0 +1,16 @@
+{
+  "name": "Lyra & Ezra · 我们的时光",
+  "short_name": "Lyra & Ezra",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#070711",
+  "theme_color": "#070711",
+  "icons": [
+    {
+      "src": "icon.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
