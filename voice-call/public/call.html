@@ -70,7 +70,7 @@ async function init() {
 function replay(c) {
   sub.textContent = `通话时长 ${fmt(c.durationSec)}`;
   $('#decline').classList.add('hide');
-  c.history.forEach((l) => bubble(l.role === 'ai' ? 'ai' : 'me', l.text));
+  c.history.forEach((l) => bubble(l.role === 'ai' ? 'ai' : 'me', l.text.replace(/\[[^\]]*\]\s*/g, '').trim()));
   if (!c.history.length) { $('#replay').textContent = c.reason === 'missed' ? '未接来电' : '无通话内容'; $('#replay').classList.remove('hide'); }
 }
 
@@ -78,13 +78,13 @@ function replay(c) {
 $('#answer').onclick = async () => {
   // 在用户手势里解锁音频播放 + 申请麦克风权限
   ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume();
-  try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach((t) => t.stop()); }
+  try { await openMic(); }
   catch { sub.textContent = '需要麦克风权限(请使用 HTTPS 访问)'; return; }
   $('#answer').classList.add('hide');
   state = 'active'; t0 = Date.now();
   timer = setInterval(() => (sub.textContent = fmt(Math.round((Date.now() - t0) / 1000))), 500);
   es = new EventSource('/api/stream?id=' + id);
-  es.addEventListener('say', (e) => { const { text } = JSON.parse(e.data); bubble('ai', text); queue.push(text); pump(); });
+  es.addEventListener('say', (e) => { const { text } = JSON.parse(e.data); bubble('ai', text.replace(/\[[^\]]*\]\s*/g, '').trim()); queue.push(text); pump(); });
   es.addEventListener('error', (e) => { if (e.data) bubble('ai', '(出错:' + JSON.parse(e.data).message + ')', true); });
   es.addEventListener('hangup', () => finish(false));
   await api('answer');
@@ -98,6 +98,7 @@ async function finish(notify) {
   const wasActive = state === 'active';
   state = 'done';
   clearInterval(timer); es && es.close(); stopRec(); queue = []; audio && audio.pause();
+  stream && stream.getTracks().forEach((t) => t.stop());
   let out = null;
   if (notify || wasActive) { try { out = await (await api('hangup')).json(); } catch {} }
   $('#decline').classList.add('hide');
@@ -122,27 +123,61 @@ async function pump() {
   if (queue.length) pump(); else if (state === 'active') startRec();
 }
 
-// ---- 语音识别(Web Speech API;iPhone Safari 可用,国内 Chrome 不可用) ----
-function startRec() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) { sub.textContent = '此浏览器不支持语音识别,请用 iPhone Safari'; return; }
-  if (rec || state !== 'active' || speaking) return;
-  rec = new SR(); rec.lang = 'zh-CN'; rec.continuous = true; rec.interimResults = true;
-  let tmp = null;
-  rec.onresult = (e) => {
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const r = e.results[i], text = r[0].transcript.trim();
-      if (!text) continue;
-      if (!tmp) tmp = bubble('me', text, true); else tmp.textContent = text;
-      log.scrollTop = log.scrollHeight;
-      if (r.isFinal) { tmp.classList.remove('tmp'); tmp = null; api('say', { text }); }
-    }
-  };
-  rec.onend = () => { rec = null; if (state === 'active' && !speaking) setTimeout(startRec, 200); };
-  rec.onerror = () => {};
-  try { rec.start(); } catch {}
+// ---- 听她说话:录音 + 简单的音量检测(VAD),一句话结束后上传给服务器转文字 ----
+// 不依赖 Google 语音服务,安卓 Chrome / iPhone Safari 都能用
+let stream = null, analyser = null, vadTimer = null, mr = null, chunks = [], voiced = 0, silent = 0, floor = 0.01, segStart = 0;
+const MIME = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4'].find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
+
+async function openMic() {
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  analyser = ctx.createAnalyser(); analyser.fftSize = 1024;
+  ctx.createMediaStreamSource(stream).connect(analyser);
 }
-function stopRec() { if (rec) { const r = rec; rec = null; r.onend = null; try { r.abort(); } catch {} } }
+
+function startRec() {
+  if (vadTimer || state !== 'active' || speaking) return;
+  const buf = new Float32Array(analyser.fftSize);
+  voiced = silent = 0;
+  vadTimer = setInterval(() => {
+    analyser.getFloatTimeDomainData(buf);
+    let sum = 0; for (const v of buf) sum += v * v;
+    const rms = Math.sqrt(sum / buf.length);
+    const th = Math.max(0.015, floor * 3);
+    if (!mr) {
+      floor = floor * 0.95 + rms * 0.05; // 跟踪环境底噪
+      voiced = rms > th ? voiced + 1 : 0;
+      if (voiced >= 3) beginSeg(); // 连续约 150ms 有声 -> 开始录
+    } else {
+      silent = rms > th * 0.7 ? 0 : silent + 1;
+      if (silent >= 18 || Date.now() - segStart > 30e3) endSeg(); // 静音约 0.9s 或满 30s -> 一句结束
+    }
+  }, 50);
+}
+
+function beginSeg() {
+  chunks = []; silent = 0; segStart = Date.now();
+  mr = new MediaRecorder(stream, MIME ? { mimeType: MIME } : undefined);
+  mr.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  mr.start();
+}
+
+function endSeg(discard) {
+  if (!mr) return;
+  const r = mr, dur = Date.now() - segStart; mr = null;
+  r.onstop = async () => {
+    if (discard || dur < 500 || state !== 'active') return;
+    const blob = new Blob(chunks, { type: r.mimeType || 'audio/webm' });
+    const b = bubble('me', '…', true);
+    try {
+      const res = await fetch('/api/hear?id=' + id, { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+      const { text } = await res.json();
+      if (text) { b.textContent = text; b.classList.remove('tmp'); } else b.remove();
+    } catch { b.remove(); }
+  };
+  r.stop();
+}
+
+function stopRec() { clearInterval(vadTimer); vadTimer = null; endSeg(true); }
 
 init();
 </script>

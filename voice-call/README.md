@@ -1,6 +1,6 @@
 # AI 语音来电
 
-AI 主动给你打电话:Telegram 推来电链接 → 手机点开接听 → 你说话(浏览器转文字)→ 你的聊天系统回复 → ElevenLabs 念出来 → 挂断后存文字记录并可回放。
+AI 主动给你打电话:Telegram 推来电链接 → 手机点开接听 → 你说话(录音交给 ElevenLabs 转文字)→ Claude 以 Ezra 的身份回复 → ElevenLabs 念出来 → 挂断后存文字记录并可回放。
 
 零依赖,只需要 Node 18+。
 
@@ -47,9 +47,13 @@ Telegram、ElevenLabs 从大陆服务器通常直连不通。三个地址都能�
 curl -X POST https://call.example.com/api/ring -H "Authorization: Bearer $RING_TOKEN" -d '{"text":"想你了"}'
 ```
 
-## 接你的聊天系统
+## 大脑
 
-在每个事件上,服务会 POST 到 `LLM_WEBHOOK_URL`:
+默认用 Claude API:把 Ezra 项目的指令复制进 `persona.md`,填 `ANTHROPIC_API_KEY` 即可。
+
+## (可选)接你自己的聊天系统
+
+设置了 `LLM_WEBHOOK_URL` 时,改为在每个事件上 POST 到 `LLM_WEBHOOK_URL`:
 
 ```json
 { "call_id": "...", "event": "answered | user | ended", "text": "用户这句话", "history": [{"role":"ai|user","text":"...","t":0}] }
@@ -59,6 +63,6 @@ curl -X POST https://call.example.com/api/ring -H "Authorization: Bearer $RING_T
 
 ## 已知限制
 
-- 语音识别用浏览器 Web Speech API:**iPhone Safari 可用**;国内 Android/Chrome 依赖 Google 服务,不可用。需要的话后续可换成腾讯云 ASR 或自建 Whisper。
+- 语音识别:通话页本地检测音量切句,录音上传给 ElevenLabs Scribe 转文字,安卓和 iPhone 都能用。AI 说话时暂停收音,所以暂不支持打断。
 - 目前存的是文字记录,没有录音回放。
 - 记录按 `RETAIN_DAYS` 自动删除。

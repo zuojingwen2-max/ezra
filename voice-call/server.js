@@ -22,7 +22,13 @@ const CFG = {
   elVoice: env('ELEVENLABS_VOICE_ID'),
   elModel: env('ELEVENLABS_MODEL', 'eleven_v3'),
   elBase: env('ELEVENLABS_BASE_URL', 'https://api.elevenlabs.io'),
-  // LLM:POST {call_id,event,text,history} -> {reply}
+  elSttModel: env('ELEVENLABS_STT_MODEL', 'scribe_v1'),
+  // 大脑:优先 Claude API(Ezra 人设放在 PERSONA_FILE);也可改用 webhook
+  anthropicKey: env('ANTHROPIC_API_KEY'),
+  anthropicBase: env('ANTHROPIC_BASE_URL', 'https://api.anthropic.com'),
+  claudeModel: env('CLAUDE_MODEL', 'claude-sonnet-5-5'),
+  personaFile: env('PERSONA_FILE', path.join(__dirname, 'persona.md')),
+  // LLM webhook:POST {call_id,event,text,history} -> {reply}
   llmWebhook: env('LLM_WEBHOOK_URL'),
   llmWebhookToken: env('LLM_WEBHOOK_TOKEN'),
 };
@@ -54,7 +60,36 @@ const addLine = (call, role, text) => {
   return line;
 };
 
+const CALL_RULES = `
+现在是一通语音电话,是你主动打给她的。你的每句回复都会被 ElevenLabs 直接念出来:
+- 只写说出口的话,口语、短句,一次 1~4 句,不要列表、不要 markdown、不要动作描写。
+- 可以用 [方括号] 标注语气(如 [low, close] [quiet laugh]),克制使用。
+- 她的话来自语音识别,可能有错字,按意思理解。`;
+
+async function askClaude(call, event) {
+  if (event === 'ended') return '';
+  const persona = fs.existsSync(CFG.personaFile) ? fs.readFileSync(CFG.personaFile, 'utf8') : '';
+  // 消息必须以 user 开头、角色交替:用一句旁白开场,再合并同角色的连续行
+  const messages = [{ role: 'user', content: '(电话接通了,她接起来了。你先开口。)' }];
+  for (const l of call.history) {
+    const role = l.role === 'ai' ? 'assistant' : 'user';
+    const last = messages[messages.length - 1];
+    if (last.role === role) last.content += '\n' + l.text;
+    else messages.push({ role, content: l.text });
+  }
+  if (messages[messages.length - 1].role === 'assistant') return '';
+  const r = await fetch(`${CFG.anthropicBase}/v1/messages`, {
+    method: 'POST',
+    headers: { 'x-api-key': CFG.anthropicKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: CFG.claudeModel, max_tokens: 400, system: persona + '\n' + CALL_RULES, messages }),
+  });
+  if (!r.ok) throw new Error('claude ' + r.status + ' ' + (await r.text()).slice(0, 200));
+  const j = await r.json();
+  return j.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+}
+
 async function askLLM(call, event, text) {
+  if (CFG.anthropicKey && !CFG.llmWebhook) return askClaude(call, event);
   if (!CFG.llmWebhook) return '(还没配置 LLM_WEBHOOK_URL,我现在只会复读:' + (text || '喂') + ')';
   const r = await fetch(CFG.llmWebhook, {
     method: 'POST',
@@ -147,6 +182,29 @@ const routes = {
     send(res, 200, { ok: true });
     try {
       const reply = await askLLM(c, 'user', text.trim());
+      if (reply) { addLine(c, 'ai', reply); emit(c, 'say', { text: reply }); }
+    } catch (e) { emit(c, 'error', { message: e.message }); }
+  },
+
+  // 用户的一段语音(浏览器录音)-> ElevenLabs Scribe 转文字 -> 同 /api/say
+  'POST /api/hear': async (req, res, url) => {
+    const c = getCall(url.searchParams.get('id'));
+    if (!c || c.state !== 'active') return send(res, 409, { error: 'not active' });
+    const chunks = []; let size = 0;
+    for await (const ch of req) { size += ch.length; if (size > 10e6) return send(res, 413, { error: 'too large' }); chunks.push(ch); }
+    const type = req.headers['content-type'] || 'audio/webm';
+    const fd = new FormData();
+    fd.append('model_id', CFG.elSttModel);
+    fd.append('file', new Blob([Buffer.concat(chunks)], { type }), 'speech.' + (type.includes('mp4') ? 'mp4' : type.includes('ogg') ? 'ogg' : 'webm'));
+    const r = await fetch(`${CFG.elBase}/v1/speech-to-text`, { method: 'POST', headers: { 'xi-api-key': CFG.elKey }, body: fd });
+    if (!r.ok) return send(res, 502, { error: 'stt ' + r.status });
+    const text = ((await r.json()).text || '').trim();
+    // 过滤识别出的纯噪声,如 "(背景噪音)"
+    if (!text || /^[\s(\[(].*[)\])]\s*$/.test(text)) return send(res, 200, { text: '' });
+    addLine(c, 'user', text);
+    send(res, 200, { text });
+    try {
+      const reply = await askLLM(c, 'user', text);
       if (reply) { addLine(c, 'ai', reply); emit(c, 'say', { text: reply }); }
     } catch (e) { emit(c, 'error', { message: e.message }); }
   },
