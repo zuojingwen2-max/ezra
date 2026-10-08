@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>来电</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root { --bg: #070711; --gold: #c9a96e; --text: #e8e0d4; --dim: #8a8494; --ai: #1c1c30; --me: #a85a6a; }
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, "PingFang SC", "Noto Sans SC", sans-serif; }
+#app { height: 100%; display: flex; flex-direction: column; padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+header { text-align: center; padding: 28px 16px 16px; }
+.avatar { width: 84px; height: 84px; border-radius: 50%; object-fit: cover; border: 2px solid var(--gold); }
+.name { margin-top: 10px; font-size: 20px; letter-spacing: 1px; }
+.sub { margin-top: 4px; font-size: 14px; color: var(--dim); font-variant-numeric: tabular-nums; }
+#log { flex: 1; overflow-y: auto; padding: 8px 16px; display: flex; flex-direction: column; gap: 10px; }
+.b { max-width: 78%; padding: 10px 14px; border-radius: 16px; line-height: 1.5; font-size: 15px; word-break: break-word; }
+.b.ai { align-self: flex-start; background: var(--ai); border-bottom-left-radius: 4px; }
+.b.me { align-self: flex-end; background: var(--me); border-bottom-right-radius: 4px; }
+.b.tmp { opacity: .55; }
+footer { display: flex; justify-content: center; gap: 56px; padding: 20px 0 28px; }
+.btn { width: 68px; height: 68px; border-radius: 50%; border: 0; font-size: 28px; color: #fff; cursor: pointer; }
+.red { background: #d64545; } .green { background: #3cb371; }
+.hide { display: none !important; }
+#replay { padding: 8px 16px 20px; color: var(--dim); font-size: 14px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <img class="avatar" src="icon.png" alt="" onerror="this.style.visibility='hidden'">
+    <div class="name">Ezra</div>
+    <div class="sub" id="sub">连接中…</div>
+  </header>
+  <div id="log"></div>
+  <div id="replay" class="hide"></div>
+  <footer>
+    <button class="btn red" id="decline" title="拒接 / 挂断">✕</button>
+    <button class="btn green hide" id="answer" title="接听">✆</button>
+  </footer>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const id = new URLSearchParams(location.search).get('id');
+const log = $('#log'), sub = $('#sub');
+let state = 'init', timer = null, t0 = 0, es = null, rec = null, speaking = false, queue = [], audio = null, ctx = null;
+
+const bubble = (role, text, tmp) => {
+  const d = document.createElement('div');
+  d.className = 'b ' + role + (tmp ? ' tmp' : '');
+  d.textContent = text;
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+  return d;
+};
+const fmt = (s) => String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+const api = (p, body) => fetch('/api/' + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, ...body }) });
+
+async function init() {
+  if (!id) { sub.textContent = '链接无效'; return; }
+  // 回放:已结束的通话
+  const done = await fetch('/api/call?id=' + id);
+  if (done.ok) return replay(await done.json());
+  const st = await fetch('/api/state?id=' + id);
+  if (!st.ok) { sub.textContent = '来电已失效'; $('#decline').classList.add('hide'); return; }
+  const { state: s } = await st.json();
+  if (s === 'ringing') { sub.textContent = '邀请你语音通话…'; $('#answer').classList.remove('hide'); }
+  else { sub.textContent = '通话进行中,请从原设备继续'; }
+}
+
+function replay(c) {
+  sub.textContent = `通话时长 ${fmt(c.durationSec)}`;
+  $('#decline').classList.add('hide');
+  c.history.forEach((l) => bubble(l.role === 'ai' ? 'ai' : 'me', l.text));
+  if (!c.history.length) { $('#replay').textContent = c.reason === 'missed' ? '未接来电' : '无通话内容'; $('#replay').classList.remove('hide'); }
+}
+
+// ---- 接听 ----
+$('#answer').onclick = async () => {
+  // 在用户手势里解锁音频播放 + 申请麦克风权限
+  ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume();
+  try { (await navigator.mediaDevices.getUserMedia({ audio: true })).getTracks().forEach((t) => t.stop()); }
+  catch { sub.textContent = '需要麦克风权限(请使用 HTTPS 访问)'; return; }
+  $('#answer').classList.add('hide');
+  state = 'active'; t0 = Date.now();
+  timer = setInterval(() => (sub.textContent = fmt(Math.round((Date.now() - t0) / 1000))), 500);
+  es = new EventSource('/api/stream?id=' + id);
+  es.addEventListener('say', (e) => { const { text } = JSON.parse(e.data); bubble('ai', text); queue.push(text); pump(); });
+  es.addEventListener('error', (e) => { if (e.data) bubble('ai', '(出错:' + JSON.parse(e.data).message + ')', true); });
+  es.addEventListener('hangup', () => finish(false));
+  await api('answer');
+  startRec();
+};
+
+$('#decline').onclick = () => finish(true);
+
+async function finish(notify) {
+  if (state === 'done') return;
+  const wasActive = state === 'active';
+  state = 'done';
+  clearInterval(timer); es && es.close(); stopRec(); queue = []; audio && audio.pause();
+  let out = null;
+  if (notify || wasActive) { try { out = await (await api('hangup')).json(); } catch {} }
+  $('#decline').classList.add('hide');
+  sub.textContent = wasActive ? `通话结束 · ${fmt(Math.round((Date.now() - t0) / 1000))}` : '已结束';
+  if (out && out.id) { $('#replay').textContent = '刷新本页可回放文字记录'; $('#replay').classList.remove('hide'); }
+}
+
+// ---- AI 说话(TTS 播放队列) ----
+async function pump() {
+  if (speaking || !queue.length) return;
+  speaking = true; stopRec();
+  const text = queue.shift();
+  try {
+    const r = await fetch('/api/tts?id=' + id + '&text=' + encodeURIComponent(text));
+    if (!r.ok) throw new Error('tts ' + r.status);
+    const url = URL.createObjectURL(await r.blob());
+    audio = new Audio(url);
+    await new Promise((ok) => { audio.onended = audio.onerror = ok; audio.play().catch(ok); });
+    URL.revokeObjectURL(url);
+  } catch (e) { console.warn(e); } // TTS 失败时仍保留文字气泡
+  speaking = false;
+  if (queue.length) pump(); else if (state === 'active') startRec();
+}
+
+// ---- 语音识别(Web Speech API;iPhone Safari 可用,国内 Chrome 不可用) ----
+function startRec() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { sub.textContent = '此浏览器不支持语音识别,请用 iPhone Safari'; return; }
+  if (rec || state !== 'active' || speaking) return;
+  rec = new SR(); rec.lang = 'zh-CN'; rec.continuous = true; rec.interimResults = true;
+  let tmp = null;
+  rec.onresult = (e) => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const r = e.results[i], text = r[0].transcript.trim();
+      if (!text) continue;
+      if (!tmp) tmp = bubble('me', text, true); else tmp.textContent = text;
+      log.scrollTop = log.scrollHeight;
+      if (r.isFinal) { tmp.classList.remove('tmp'); tmp = null; api('say', { text }); }
+    }
+  };
+  rec.onend = () => { rec = null; if (state === 'active' && !speaking) setTimeout(startRec, 200); };
+  rec.onerror = () => {};
+  try { rec.start(); } catch {}
+}
+function stopRec() { if (rec) { const r = rec; rec = null; r.onend = null; try { r.abort(); } catch {} } }
+
+init();
+</script>
+</body>
+</html>
