@@ -32,6 +32,40 @@ if 'sc["mp3"]' not in s:
     print("✓ voice_say 的结构化结果里加上了 mp3 链接")
 else:
     print("· 结构化结果已经有 mp3 链接，跳过")
+# 第三处：voice_say(telegram=True) 由服务器自己把语音条发到她的 Telegram
+if "telegram: bool = False" not in s:
+    old_sig = 'speed: float = -1, ctx: Context = None):'
+    old_doc = '    stability/style/speed: -1 = saved defaults (v4 ignores style and speed)."""'
+    old_ret = '    return ToolResult(content=[TextContent(type="text", text=msg)], structured_content=sc)'
+    old_hdr = '@mcp.tool(output_schema=None, meta={"ui": {"resourceUri": UI_URI}, "ui/resourceUri": UI_URI})\nasync def voice_say('
+    for a in (old_sig, old_doc, old_ret, old_hdr):
+        if s.count(a) != 1:
+            sys.exit(f"✗ 没找到要改的地方（{a[:40]}…），第三处没改")
+    helper = (
+        'async def _tg_voice(url):\n'
+        '    k = ccfg()\n'
+        '    tok, chat = k.get("telegram_bot_token"), k.get("telegram_chat_id")\n'
+        '    if not (tok and chat):\n'
+        '        return "telegram: not configured"\n'
+        '    base = k.get("telegram_api_base", "https://api.telegram.org").rstrip("/")\n'
+        '    try:\n'
+        '        async with httpx.AsyncClient(timeout=60, proxy=k.get("proxy") or None) as cl:\n'
+        '            r = await cl.post(f"{base}/bot{tok}/sendVoice", json={"chat_id": chat, "voice": url})\n'
+        '        return "telegram: sent" if r.status_code == 200 else f"telegram: {r.status_code} {r.text[:120]}"\n'
+        '    except Exception as ex:\n'
+        '        return f"telegram: failed ({type(ex).__name__})"\n\n\n')
+    s = s.replace(old_hdr, helper + old_hdr)
+    s = s.replace(old_sig, 'speed: float = -1, telegram: bool = False, ctx: Context = None):')
+    s = s.replace(old_doc, '    `telegram`: True = also send this clip to her Telegram as a voice note (the server sends it;\n'
+                           '    don\'t add MEDIA lines or [[tts:text]] then). Use it when you are not in the Claude app.\n' + old_doc)
+    s = s.replace(old_ret, '    if telegram:\n'
+                           '        sc["telegram"] = await _tg_voice(clip_url(e["id"]))\n'
+                           '        sc.pop("send_on_telegram", None)\n'
+                           '        msg += f"\\n{sc[\'telegram\']}"\n' + old_ret)
+    open(p, "w", encoding="utf-8").write(s)
+    print("✓ voice_say 加上了 telegram 参数（服务器直接发语音条）")
+else:
+    print("· telegram 参数已经有了，跳过")
 if "MEDIA:{clip_url" in s:
     print("· 文字说明已经改过，跳过"); sys.exit(0)
 old_msg = 'msg = f"voice saved ({e[\'id\']}) — this client can\'t show the player; she can hear it on {PUBLIC}"'
