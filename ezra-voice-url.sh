@@ -21,8 +21,19 @@ python3 - "$PY" <<'PY_EOF'
 import sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
+# 第二处：链接也放进结构化结果（Claude Code / OpenClaw 只看这一部分）
+old_sc = 'sc = {"id": e["id"], "name": "ezra", "text": spoken, "time": e["ts"][11:16]}'
+new_sc = old_sc + '\n    sc["mp3"] = clip_url(e["id"])\n    sc["send_on_telegram"] = f"MEDIA:{sc[\'mp3\']}\\n[[audio_as_voice]]"'
+if 'sc["mp3"]' not in s:
+    if s.count(old_sc) != 1:
+        sys.exit("✗ server.py 里没找到 voice_say 的返回结构，什么都没改")
+    s = s.replace(old_sc, new_sc)
+    open(p, "w", encoding="utf-8").write(s)
+    print("✓ voice_say 的结构化结果里加上了 mp3 链接")
+else:
+    print("· 结构化结果已经有 mp3 链接，跳过")
 if "MEDIA:{clip_url" in s:
-    print("· server.py 已经改过，跳过"); sys.exit(0)
+    print("· 文字说明已经改过，跳过"); sys.exit(0)
 old_msg = 'msg = f"voice saved ({e[\'id\']}) — this client can\'t show the player; she can hear it on {PUBLIC}"'
 new_msg = ('msg = (f"voice saved ({e[\'id\']}) and on her voice page.\\n"\n'
            '               f"To send it to her on Telegram, end your reply with these two lines exactly:\\n"\n'
