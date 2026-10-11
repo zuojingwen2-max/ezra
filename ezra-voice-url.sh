@@ -61,7 +61,7 @@ if "telegram: bool = False" not in s:
     s = s.replace(old_ret, '    if telegram:\n'
                            '        sc["telegram"] = await _tg_voice(clip_url(e["id"]))\n'
                            '        sc.pop("send_on_telegram", None)\n'
-                           '        msg += f"\\n{sc[\'telegram\']}"\n' + old_ret)
+                           '        msg = f"voice saved ({e[\'id\']}) and sent to her Telegram by the server: {sc[\'telegram\']}. Don\'t add MEDIA lines or [[tts:text]] for this clip."\n' + old_ret)
     open(p, "w", encoding="utf-8").write(s)
     print("✓ voice_say 加上了 telegram 参数（服务器直接发语音条）")
 else:
